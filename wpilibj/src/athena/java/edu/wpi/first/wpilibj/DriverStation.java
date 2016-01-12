@@ -8,6 +8,7 @@
 package edu.wpi.first.wpilibj;
 
 import java.nio.ByteBuffer;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import edu.wpi.first.wpilibj.communication.FRCNetworkCommunicationsLibrary;
 import edu.wpi.first.wpilibj.communication.HALControlWord;
@@ -69,6 +70,8 @@ public class DriverStation implements RobotState.Interface {
 
   private Thread m_thread;
   private final Object m_dataSem;
+  private final Object m_newControlDataMutex;
+  private final ReentrantReadWriteLock m_joystickMutex;
   private volatile boolean m_thread_keepalive = true;
   private boolean m_userInDisabled = false;
   private boolean m_userInAutonomous = false;
@@ -95,6 +98,8 @@ public class DriverStation implements RobotState.Interface {
    */
   protected DriverStation() {
     m_dataSem = new Object();
+    m_joystickMutex = new ReentrantReadWriteLock();
+    m_newControlDataMutex = new Object();
     for (int i = 0; i < kJoystickPorts; i++) {
       m_joystickButtons[i] = new HALJoystickButtons();
     }
@@ -123,9 +128,7 @@ public class DriverStation implements RobotState.Interface {
     int safetyCounter = 0;
     while (m_thread_keepalive) {
       HALUtil.takeMultiWait(m_packetDataAvailableSem, m_packetDataAvailableMutex);
-      synchronized (this) {
-        getData();
-      }
+      getData();
       synchronized (m_dataSem) {
         m_dataSem.notifyAll();
       }
@@ -175,8 +178,9 @@ public class DriverStation implements RobotState.Interface {
    * just be returned, otherwise the data will be copied from the DS polling
    * loop.
    */
-  protected synchronized void getData() {
-
+  protected void getData() {
+    //Lock the joystick mutex in exclusive write mode.
+    m_joystickMutex.writeLock().lock();
     // Get the status of all of the joysticks
     for (byte stick = 0; stick < kJoystickPorts; stick++) {
       m_joystickAxes[stick] = FRCNetworkCommunicationsLibrary.HALGetJoystickAxes(stick);
@@ -186,8 +190,11 @@ public class DriverStation implements RobotState.Interface {
           FRCNetworkCommunicationsLibrary.HALGetJoystickButtons((byte) stick, countBuffer);
       m_joystickButtons[stick].count = countBuffer.get();
     }
-
-    m_newControlData = true;
+    m_joystickMutex.writeLock().unlock();
+    //Lock new control data mutex and set new control data.
+    synchronized (m_newControlDataMutex) {
+      m_newControlData = true;
+    }
   }
 
   /**
@@ -219,27 +226,37 @@ public class DriverStation implements RobotState.Interface {
    * @param axis The analog axis value to read from the joystick.
    * @return The value of the axis on the joystick.
    */
-  public synchronized double getStickAxis(int stick, int axis) {
-    if (stick < 0 || stick >= kJoystickPorts) {
-      throw new RuntimeException("Joystick index is out of range, should be 0-5");
-    }
+  public double getStickAxis(int stick, int axis) {
+    boolean lockEntered = false;
+    try {
+      m_joystickMutex.readLock().lock();
+      lockEntered = true;
+      if (stick < 0 || stick >= kJoystickPorts) {
+        throw new RuntimeException("Joystick index is out of range, should be 0-5");
+      }
 
-    if (axis < 0 || axis >= FRCNetworkCommunicationsLibrary.kMaxJoystickAxes) {
-      throw new RuntimeException("Joystick axis is out of range");
-    }
+      if (axis < 0 || axis >= FRCNetworkCommunicationsLibrary.kMaxJoystickAxes) {
+        throw new RuntimeException("Joystick axis is out of range");
+      }
 
-    if (axis >= m_joystickAxes[stick].length) {
-      reportJoystickUnpluggedError("WARNING: Joystick axis " + axis + " on port " + stick
-          + " not available, check if controller is plugged in\n");
-      return 0.0;
-    }
+      if (axis >= m_joystickAxes[stick].length) {
+        //Unlock before writing to driver station log
+        m_joystickMutex.readLock().unlock();
+        lockEntered = false;
+        reportJoystickUnpluggedError("WARNING: Joystick axis " + axis + " on port " + stick
+            + " not available, check if controller is plugged in\n");
+        return 0.0;
+      }
 
-    byte value = (byte) m_joystickAxes[stick][axis];
+      byte value = (byte) m_joystickAxes[stick][axis];
 
-    if (value < 0) {
-      return value / 128.0;
-    } else {
-      return value / 127.0;
+      if (value < 0) {
+        return value / 128.0;
+      } else {
+        return value / 127.0;
+      }
+    } finally {
+      if (lockEntered) m_joystickMutex.readLock().unlock();
     }
   }
 
@@ -249,13 +266,19 @@ public class DriverStation implements RobotState.Interface {
    * @param stick The joystick port number
    * @return The number of axes on the indicated joystick
    */
-  public synchronized int getStickAxisCount(int stick) {
+  public int getStickAxisCount(int stick) {
+    boolean lockEntered = false;
+    try {
+      m_joystickMutex.readLock().lock();
+      lockEntered = true;
+      if (stick < 0 || stick >= kJoystickPorts) {
+        throw new RuntimeException("Joystick index is out of range, should be 0-5");
+      }
 
-    if (stick < 0 || stick >= kJoystickPorts) {
-      throw new RuntimeException("Joystick index is out of range, should be 0-5");
+      return m_joystickAxes[stick].length;
+    } finally {
+      if (lockEntered) m_joystickMutex.readLock().unlock();
     }
-
-    return m_joystickAxes[stick].length;
   }
 
   /**
@@ -263,22 +286,32 @@ public class DriverStation implements RobotState.Interface {
    *
    * @return the angle of the POV in degrees, or -1 if the POV is not pressed.
    */
-  public synchronized int getStickPOV(int stick, int pov) {
-    if (stick < 0 || stick >= kJoystickPorts) {
-      throw new RuntimeException("Joystick index is out of range, should be 0-5");
-    }
+  public int getStickPOV(int stick, int pov) {
+    boolean lockEntered = false;
+    try {
+      m_joystickMutex.readLock().lock();
+      lockEntered = true;
+      if (stick < 0 || stick >= kJoystickPorts) {
+        throw new RuntimeException("Joystick index is out of range, should be 0-5");
+      }
 
-    if (pov < 0 || pov >= FRCNetworkCommunicationsLibrary.kMaxJoystickPOVs) {
-      throw new RuntimeException("Joystick POV is out of range");
-    }
+      if (pov < 0 || pov >= FRCNetworkCommunicationsLibrary.kMaxJoystickPOVs) {
+        throw new RuntimeException("Joystick POV is out of range");
+      }
 
-    if (pov >= m_joystickPOVs[stick].length) {
-      reportJoystickUnpluggedError("WARNING: Joystick POV " + pov + " on port " + stick
-          + " not available, check if controller is plugged in\n");
-      return -1;
-    }
+      if (pov >= m_joystickPOVs[stick].length) {
+        //Unlock before writing to driver station log
+        m_joystickMutex.readLock().unlock();
+        lockEntered = false;
+        reportJoystickUnpluggedError("WARNING: Joystick POV " + pov + " on port " + stick
+            + " not available, check if controller is plugged in\n");
+        return -1;
+      }
 
-    return m_joystickPOVs[stick][pov];
+      return m_joystickPOVs[stick][pov];
+    } finally {
+      if (lockEntered) m_joystickMutex.readLock().unlock();
+    }
   }
 
   /**
@@ -287,13 +320,20 @@ public class DriverStation implements RobotState.Interface {
    * @param stick The joystick port number
    * @return The number of POVs on the indicated joystick
    */
-  public synchronized int getStickPOVCount(int stick) {
+  public int getStickPOVCount(int stick) {
+    boolean lockEntered = false;
+    try {
+      m_joystickMutex.readLock().lock();
+      lockEntered = true;
 
-    if (stick < 0 || stick >= kJoystickPorts) {
-      throw new RuntimeException("Joystick index is out of range, should be 0-5");
+      if (stick < 0 || stick >= kJoystickPorts) {
+        throw new RuntimeException("Joystick index is out of range, should be 0-5");
+      }
+
+      return m_joystickPOVs[stick].length;
+    } finally {
+      if (lockEntered) m_joystickMutex.readLock().unlock();
     }
-
-    return m_joystickPOVs[stick].length;
   }
 
   /**
@@ -302,12 +342,19 @@ public class DriverStation implements RobotState.Interface {
    * @param stick The joystick to read.
    * @return The state of the buttons on the joystick.
    */
-  public synchronized int getStickButtons(final int stick) {
-    if (stick < 0 || stick >= kJoystickPorts) {
-      throw new RuntimeException("Joystick index is out of range, should be 0-3");
-    }
+  public int getStickButtons(final int stick) {
+    boolean lockEntered = false;
+    try {
+      m_joystickMutex.readLock().lock();
+      lockEntered = true;
+      if (stick < 0 || stick >= kJoystickPorts) {
+        throw new RuntimeException("Joystick index is out of range, should be 0-3");
+      }
 
-    return m_joystickButtons[stick].buttons;
+      return m_joystickButtons[stick].buttons;
+    } finally {
+      if (lockEntered) m_joystickMutex.readLock().unlock();
+    }
   }
 
   /**
@@ -317,22 +364,34 @@ public class DriverStation implements RobotState.Interface {
    * @param button The button index, beginning at 1.
    * @return The state of the joystick button.
    */
-  public synchronized boolean getStickButton(final int stick, byte button) {
-    if (stick < 0 || stick >= kJoystickPorts) {
-      throw new RuntimeException("Joystick index is out of range, should be 0-3");
-    }
+  public boolean getStickButton(final int stick, byte button) {
+    boolean lockEntered = false;
+    try {
+      m_joystickMutex.readLock().lock();
+      lockEntered = true;
+      if (stick < 0 || stick >= kJoystickPorts) {
+        throw new RuntimeException("Joystick index is out of range, should be 0-3");
+      }
 
-
-    if (button > m_joystickButtons[stick].count) {
-      reportJoystickUnpluggedError("WARNING: Joystick Button " + button + " on port " + stick
-          + " not available, check if controller is plugged in\n");
-      return false;
+      if (button > m_joystickButtons[stick].count) {
+        //Unlock before writing to driver station log
+        m_joystickMutex.readLock().unlock();
+        lockEntered = false;
+        reportJoystickUnpluggedError("WARNING: Joystick Button " + button + " on port " + stick
+            + " not available, check if controller is plugged in\n");
+        return false;
+      }
+      if (button <= 0) {
+        //Unlock before writing to driver station log
+        m_joystickMutex.readLock().unlock();
+        lockEntered = false;
+        reportJoystickUnpluggedError("ERROR: Button indexes begin at 1 in WPILib for C++ and Java\n");
+        return false;
+      }
+      return ((0x1 << (button - 1)) & m_joystickButtons[stick].buttons) != 0;
+    } finally {
+      if (lockEntered) m_joystickMutex.readLock().unlock();
     }
-    if (button <= 0) {
-      reportJoystickUnpluggedError("ERROR: Button indexes begin at 1 in WPILib for C++ and Java\n");
-      return false;
-    }
-    return ((0x1 << (button - 1)) & m_joystickButtons[stick].buttons) != 0;
   }
 
   /**
@@ -341,14 +400,20 @@ public class DriverStation implements RobotState.Interface {
    * @param stick The joystick port number
    * @return The number of buttons on the indicated joystick
    */
-  public synchronized int getStickButtonCount(int stick) {
+  public int getStickButtonCount(int stick) {
+    boolean lockEntered = false;
+    try {
+      m_joystickMutex.readLock().lock();
+      lockEntered = true;
+      if (stick < 0 || stick >= kJoystickPorts) {
+        throw new RuntimeException("Joystick index is out of range, should be 0-5");
+      }
 
-    if (stick < 0 || stick >= kJoystickPorts) {
-      throw new RuntimeException("Joystick index is out of range, should be 0-5");
+
+      return m_joystickButtons[stick].count;
+    } finally {
+      if (lockEntered) m_joystickMutex.readLock().unlock();
     }
-
-
-    return m_joystickButtons[stick].count;
   }
 
   /**
@@ -357,23 +422,32 @@ public class DriverStation implements RobotState.Interface {
    * @param stick The joystick port number
    * @return A boolean that returns the value of isXbox
    */
-  public synchronized boolean getJoystickIsXbox(int stick) {
-
-    if (stick < 0 || stick >= kJoystickPorts) {
-      throw new RuntimeException("Joystick index is out of range, should be 0-5");
+  public boolean getJoystickIsXbox(int stick) {
+    boolean lockEntered = false;
+    try {
+      m_joystickMutex.readLock().lock();
+      lockEntered = true;
+      if (stick < 0 || stick >= kJoystickPorts) {
+        throw new RuntimeException("Joystick index is out of range, should be 0-5");
+      }
+      // TODO: Remove this when calling for descriptor on empty stick no longer
+      // crashes
+      if (1 > m_joystickButtons[stick].count && 1 > m_joystickAxes[stick].length) {
+        //Unlock before writing to driver station log
+        m_joystickMutex.readLock().unlock();
+        lockEntered = false;
+        reportJoystickUnpluggedError("WARNING: Joystick on port " + stick
+            + " not available, check if controller is plugged in\n");
+        return false;
+      }
+      boolean retVal = false;
+      if (FRCNetworkCommunicationsLibrary.HALGetJoystickIsXbox((byte) stick) == 1) {
+        retVal = true;
+      }
+      return retVal;
+    } finally {
+      if (lockEntered) m_joystickMutex.readLock().unlock();
     }
-    // TODO: Remove this when calling for descriptor on empty stick no longer
-    // crashes
-    if (1 > m_joystickButtons[stick].count && 1 > m_joystickAxes[stick].length) {
-      reportJoystickUnpluggedError("WARNING: Joystick on port " + stick
-          + " not available, check if controller is plugged in\n");
-      return false;
-    }
-    boolean retVal = false;
-    if (FRCNetworkCommunicationsLibrary.HALGetJoystickIsXbox((byte) stick) == 1) {
-      retVal = true;
-    }
-    return retVal;
   }
 
   /**
@@ -382,19 +456,28 @@ public class DriverStation implements RobotState.Interface {
    * @param stick The joystick port number
    * @return The value of type
    */
-  public synchronized int getJoystickType(int stick) {
-
-    if (stick < 0 || stick >= kJoystickPorts) {
-      throw new RuntimeException("Joystick index is out of range, should be 0-5");
+  public int getJoystickType(int stick) {
+    boolean lockEntered = false;
+    try {
+      m_joystickMutex.readLock().lock();
+      lockEntered = true;
+      if (stick < 0 || stick >= kJoystickPorts) {
+        throw new RuntimeException("Joystick index is out of range, should be 0-5");
+      }
+      // TODO: Remove this when calling for descriptor on empty stick no longer
+      // crashes
+      if (1 > m_joystickButtons[stick].count && 1 > m_joystickAxes[stick].length) {
+        //Unlock before writing to driver station log
+        m_joystickMutex.readLock().unlock();
+        lockEntered = false;
+        reportJoystickUnpluggedError("WARNING: Joystick on port " + stick
+            + " not available, check if controller is plugged in\n");
+        return -1;
+      }
+      return FRCNetworkCommunicationsLibrary.HALGetJoystickType((byte) stick);
+    } finally {
+      if (lockEntered) m_joystickMutex.readLock().unlock();
     }
-    // TODO: Remove this when calling for descriptor on empty stick no longer
-    // crashes
-    if (1 > m_joystickButtons[stick].count && 1 > m_joystickAxes[stick].length) {
-      reportJoystickUnpluggedError("WARNING: Joystick on port " + stick
-          + " not available, check if controller is plugged in\n");
-      return -1;
-    }
-    return FRCNetworkCommunicationsLibrary.HALGetJoystickType((byte) stick);
   }
 
   /**
@@ -403,19 +486,28 @@ public class DriverStation implements RobotState.Interface {
    * @param stick The joystick port number
    * @return The value of name
    */
-  public synchronized String getJoystickName(int stick) {
-
-    if (stick < 0 || stick >= kJoystickPorts) {
-      throw new RuntimeException("Joystick index is out of range, should be 0-5");
+  public String getJoystickName(int stick) {
+    boolean lockEntered = false;
+    try {
+      m_joystickMutex.readLock().lock();
+      lockEntered = true;
+      if (stick < 0 || stick >= kJoystickPorts) {
+        throw new RuntimeException("Joystick index is out of range, should be 0-5");
+      }
+      // TODO: Remove this when calling for descriptor on empty stick no longer
+      // crashes
+      if (1 > m_joystickButtons[stick].count && 1 > m_joystickAxes[stick].length) {
+        //Unlock before writing to driver station log
+        m_joystickMutex.readLock().unlock();
+        lockEntered = false;
+        reportJoystickUnpluggedError("WARNING: Joystick on port " + stick
+            + " not available, check if controller is plugged in\n");
+        return "";
+      }
+      return FRCNetworkCommunicationsLibrary.HALGetJoystickName((byte) stick);
+    } finally {
+      if (lockEntered) m_joystickMutex.readLock().unlock();
     }
-    // TODO: Remove this when calling for descriptor on empty stick no longer
-    // crashes
-    if (1 > m_joystickButtons[stick].count && 1 > m_joystickAxes[stick].length) {
-      reportJoystickUnpluggedError("WARNING: Joystick on port " + stick
-          + " not available, check if controller is plugged in\n");
-      return "";
-    }
-    return FRCNetworkCommunicationsLibrary.HALGetJoystickName((byte) stick);
   }
 
   /**
@@ -498,10 +590,12 @@ public class DriverStation implements RobotState.Interface {
    *$
    * @return True if the control data has been updated since the last call.
    */
-  public synchronized boolean isNewControlData() {
-    boolean result = m_newControlData;
-    m_newControlData = false;
-    return result;
+  public boolean isNewControlData() {
+    synchronized (m_newControlDataMutex) {
+      boolean result = m_newControlData;
+      m_newControlData = false;
+      return result;
+    }
   }
 
   /**
