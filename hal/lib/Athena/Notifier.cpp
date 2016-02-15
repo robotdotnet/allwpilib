@@ -6,12 +6,14 @@
 /*----------------------------------------------------------------------------*/
 
 #include "HAL/Notifier.hpp"
+#include "HAL/CallbackThread.hpp"
 #include "ChipObject.h"
 #include "HAL/HAL.hpp"
 #include "HAL/cpp/priority_mutex.h"
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
+#include "SafeThread.h"
 
 static const uint32_t kTimerInterruptNumber = 28;
 
@@ -97,6 +99,33 @@ void* initializeNotifier(void (*process)(uint64_t, void*), void *param, int32_t 
 	notifier->process = process;
 	notifiers = notifier;
 	return notifier;
+}
+
+void* initializeNotifierThreaded(int32_t (*init)(void*), void (*process)(uint64_t, void*), void (*end)(void*), void *param, int32_t *status)
+{
+	CallbackThread* notify = new CallbackThread;
+	notify->Start();
+	notify->SetFunc(init, process, end, param);
+	
+	void *notifierPtr = initializeNotifier(callbackHandler, notify, status);
+	
+	if (!notifierPtr || *status != 0)
+	{
+		delete notify;
+	}
+	
+	return notifierPtr;
+}
+
+void* cleanNotifierThreaded(void* notifier_pointer, int32_t *status)
+{
+	CallbackThread* notify = (CallbackThread*)getNotifierParam(notifier_pointer, status);
+  void* param = nullptr;
+  if (notify)
+    param = notify->GetParam();
+	cleanNotifier(notifier_pointer, status);
+	delete notify;
+  return param;
 }
 
 void cleanNotifier(void* notifier_pointer, int32_t *status)

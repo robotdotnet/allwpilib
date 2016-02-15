@@ -41,7 +41,7 @@ void InterruptableSensorBase::RequestInterrupts(
   requestInterrupts(m_interrupt, GetModuleForRouting(), GetChannelForRouting(),
                     GetAnalogTriggerForRouting(), &status);
   SetUpSourceEdge(true, false);
-  attachInterruptHandler(m_interrupt, handler, param, &status);
+  attachInterruptHandlerThreaded(m_interrupt, nullptr, handler, nullptr, param, &status);
   wpi_setErrorWithContext(status, getHALErrorMessage(status));
 }
 

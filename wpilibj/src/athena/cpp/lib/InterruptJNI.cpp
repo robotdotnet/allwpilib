@@ -24,92 +24,46 @@ TLogLevel interruptJNILogLevel = logERROR;
 	if (level > interruptJNILogLevel) ; \
 	else Log().Get(level)
 
-// Thread where callbacks are actually performed.
-//
-// JNI's AttachCurrentThread() creates a Java Thread object on every
-// invocation, which is both time inefficient and causes issues with Eclipse
-// (which tries to keep a thread list up-to-date and thus gets swamped).
-//
-// Instead, this class attaches just once.  When a hardware notification
-// occurs, a condition variable wakes up this thread and this thread actually
-// makes the call into Java.
-//
-// We don't want to use a FIFO here. If the user code takes too long to
-// process, we will just ignore the redundant wakeup.
-class InterruptThreadJNI : public SafeThread {
- public:
-  void Main();
-
-  bool m_notify = false;
-  uint32_t m_mask = 0;
-  jobject m_func = nullptr;
-  jmethodID m_mid;
-  jobject m_param = nullptr;
+struct InterruptData {
+  JNIEnv *env;
+  jobject func = nullptr;
+  jmethodID mid;
+  jobject param = nullptr;
 };
 
-class InterruptJNI : public SafeThreadOwner<InterruptThreadJNI> {
- public:
-  void SetFunc(JNIEnv* env, jobject func, jmethodID mid, jobject param);
-
-  void Notify(uint32_t mask) {
-    auto thr = GetThread();
-    if (!thr) return;
-    thr->m_notify = true;
-    thr->m_mask = mask;
-    thr->m_cond.notify_one();
-  }
-};
-
-void InterruptJNI::SetFunc(JNIEnv* env, jobject func, jmethodID mid,
-                           jobject param) {
-  auto thr = GetThread();
-  if (!thr) return;
-  // free global references
-  if (thr->m_func) env->DeleteGlobalRef(thr->m_func);
-  if (thr->m_param) env->DeleteGlobalRef(thr->m_param);
-  // create global references
-  thr->m_func = env->NewGlobalRef(func);
-  thr->m_param = param ? env->NewGlobalRef(param) : nullptr;
-  thr->m_mid = mid;
-}
-
-void InterruptThreadJNI::Main() {
+static int32_t interruptInit(void* param) {
+  if (!param) return 1;
+  InterruptData* data = (InterruptData*)param;
   JNIEnv *env;
   JavaVMAttachArgs args;
   args.version = JNI_VERSION_1_2;
   args.name = const_cast<char*>("Interrupt");
   args.group = nullptr;
   jint rs = jvm->AttachCurrentThreadAsDaemon((void**)&env, &args);
-  if (rs != JNI_OK) return;
-
-  std::unique_lock<std::mutex> lock(m_mutex);
-  while (m_active) {
-    m_cond.wait(lock, [&] { return !m_active || m_notify; });
-    if (!m_active) break;
-    m_notify = false;
-    if (!m_func) continue;
-    jobject func = m_func;
-    jmethodID mid = m_mid;
-    uint32_t mask = m_mask;
-    jobject param = m_param;
-    lock.unlock();  // don't hold mutex during callback execution
-    env->CallVoidMethod(func, mid, (jint)mask, param);
-    if (env->ExceptionCheck()) {
-      env->ExceptionDescribe();
-      env->ExceptionClear();
-    }
-    lock.lock();
-  }
-
-  // free global references
-  if (m_func) env->DeleteGlobalRef(m_func);
-  if (m_param) env->DeleteGlobalRef(m_param);
-
-  jvm->DetachCurrentThread();
+  if (rs != JNI_OK) return 1;
+  data->env = env;
+  return 0;
 }
 
-void interruptHandler(uint32_t mask, void* param) {
-  ((InterruptJNI*)param)->Notify(mask);
+static void interruptProcess(uint64_t mask, void* param) {
+  if (!param) return;
+  InterruptData* data = (InterruptData*)param;
+  if (!data->func) return;
+  JNIEnv* env = data->env;
+  env->CallVoidMethod(data->func, data->mid, (jint)mask, data->param);
+  if (env->ExceptionCheck()) {
+    env->ExceptionDescribe();
+    env->ExceptionClear();
+  }
+}
+
+static void interruptEnd(void* param) {
+  if (param) {
+    InterruptData* data = (InterruptData*)param;
+    if (data->func) data->env->DeleteGlobalRef(data->func);
+    if (data->param) data->env->DeleteGlobalRef(data->param);
+  }
+  jvm->DetachCurrentThread();
 }
 
 extern "C" {
@@ -301,14 +255,16 @@ JNIEXPORT void JNICALL Java_edu_wpi_first_wpilibj_hal_InterruptJNI_attachInterru
     return;
   }
 
-  InterruptJNI* intr = new InterruptJNI;
-  intr->Start();
-  intr->SetFunc(env, handler, mid, param);
+  InterruptData* intr = new InterruptData;
+  intr->func = env->NewGlobalRef(handler);
+  intr->param = param ? env->NewGlobalRef(param) : nullptr;
+  intr->mid = mid;
 
   INTERRUPTJNI_LOG(logDEBUG) << "InterruptThreadJNI Ptr = " << intr;
-
+  
   int32_t status = 0;
-  attachInterruptHandler((void*)interrupt_pointer, interruptHandler, intr,
+  attachInterruptHandlerThreaded((void*)interrupt_pointer, interruptInit, interruptProcess,
+                          interruptEnd, intr,
                          &status);
 
   INTERRUPTJNI_LOG(logDEBUG) << "Status = " << status;

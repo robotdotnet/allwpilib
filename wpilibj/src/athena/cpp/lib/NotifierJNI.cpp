@@ -26,86 +26,45 @@ TLogLevel notifierJNILogLevel = logWARNING;
     if (level > notifierJNILogLevel) ; \
     else Log().Get(level)
 
-// Thread where callbacks are actually performed.
-//
-// JNI's AttachCurrentThread() creates a Java Thread object on every
-// invocation, which is both time inefficient and causes issues with Eclipse
-// (which tries to keep a thread list up-to-date and thus gets swamped).
-//
-// Instead, this class attaches just once.  When a hardware notification
-// occurs, a condition variable wakes up this thread and this thread actually
-// makes the call into Java.
-//
-// We don't want to use a FIFO here. If the user code takes too long to
-// process, we will just ignore the redundant wakeup.
-class NotifierThreadJNI : public SafeThread {
- public:
-  void Main();
-
-  bool m_notify = false;
-  jobject m_func = nullptr;
-  jmethodID m_mid;
-  uint64_t m_currentTime;
+struct NotifierData {
+  JNIEnv *env;
+  jobject func = nullptr;
+  jmethodID mid;
 };
 
-class NotifierJNI : public SafeThreadOwner<NotifierThreadJNI> {
- public:
-  void SetFunc(JNIEnv* env, jobject func, jmethodID mid);
-
-  void Notify(uint64_t currentTime) {
-    auto thr = GetThread();
-    if (!thr) return;
-    thr->m_currentTime = currentTime;
-    thr->m_notify = true;
-    thr->m_cond.notify_one();
-  }
-};
-
-void NotifierJNI::SetFunc(JNIEnv* env, jobject func, jmethodID mid) {
-  auto thr = GetThread();
-  if (!thr) return;
-  // free global reference
-  if (thr->m_func) env->DeleteGlobalRef(thr->m_func);
-  // create global reference
-  thr->m_func = env->NewGlobalRef(func);
-  thr->m_mid = mid;
-}
-
-void NotifierThreadJNI::Main() {
+static int32_t notifierInit(void* param) {
+  if (!param) return 1;
+  NotifierData* data = (NotifierData*)param;
   JNIEnv *env;
   JavaVMAttachArgs args;
   args.version = JNI_VERSION_1_2;
   args.name = const_cast<char*>("Notifier");
   args.group = nullptr;
   jint rs = jvm->AttachCurrentThreadAsDaemon((void**)&env, &args);
-  if (rs != JNI_OK) return;
-
-  std::unique_lock<std::mutex> lock(m_mutex);
-  while (m_active) {
-    m_cond.wait(lock, [&] { return !m_active || m_notify; });
-    if (!m_active) break;
-    m_notify = false;
-    if (!m_func) continue;
-    jobject func = m_func;
-    jmethodID mid = m_mid;
-    uint64_t currentTime = m_currentTime;
-    lock.unlock();  // don't hold mutex during callback execution
-    env->CallVoidMethod(func, mid, (jlong)currentTime);
-    if (env->ExceptionCheck()) {
-      env->ExceptionDescribe();
-      env->ExceptionClear();
-    }
-    lock.lock();
-  }
-
-  // free global reference
-  if (m_func) env->DeleteGlobalRef(m_func);
-
-  jvm->DetachCurrentThread();
+  if (rs != JNI_OK) return 1;
+  data->env = env;
+  return 0;
 }
 
-void notifierHandler(uint64_t currentTimeInt, void* param) {
-  ((NotifierJNI*)param)->Notify(currentTimeInt);
+static void notifierProcess(uint64_t currentTimeInt, void* param) {
+  if (!param) return;
+  NotifierData* data = (NotifierData*)param;
+  if (!data->func) return;
+  JNIEnv* env = data->env;
+  env->CallVoidMethod(data->func, data->mid, (jlong)currentTimeInt);
+  if (env->ExceptionCheck()) {
+    env->ExceptionDescribe();
+    env->ExceptionClear();
+  }
+}
+
+static void notifierEnd(void* param) {
+  if (param) {
+    NotifierData* data = (NotifierData*)param;
+    if (data->func) data->env->DeleteGlobalRef(data->func);
+  }
+
+  jvm->DetachCurrentThread();
 }
 
 extern "C" {
@@ -135,11 +94,11 @@ JNIEXPORT jlong JNICALL Java_edu_wpi_first_wpilibj_hal_NotifierJNI_initializeNot
 
   // each notifier runs in its own thread; this is so if one takes too long
   // to execute, it doesn't keep the others from running
-  NotifierJNI* notify = new NotifierJNI;
-  notify->Start();
-  notify->SetFunc(env, func, mid);
+  NotifierData* notify = new NotifierData;
+  notify->func = env->NewGlobalRef(func);
+  notify->mid = mid;
   int32_t status = 0;
-  void *notifierPtr = initializeNotifier(notifierHandler, notify, &status);
+  void *notifierPtr = initializeNotifierThreaded(notifierInit, notifierProcess, notifierEnd, notify, &status);
 
   NOTIFIERJNI_LOG(logDEBUG) << "Notifier Ptr = " << notifierPtr;
   NOTIFIERJNI_LOG(logDEBUG) << "Status = " << status;
@@ -163,14 +122,18 @@ JNIEXPORT void JNICALL Java_edu_wpi_first_wpilibj_hal_NotifierJNI_cleanNotifier
   NOTIFIERJNI_LOG(logDEBUG) << "Calling NOTIFIERJNI cleanNotifier";
 
   NOTIFIERJNI_LOG(logDEBUG) << "Notifier Ptr = " << (void *)notifierPtr;
+  
+  
 
   int32_t status = 0;
-  NotifierJNI* notify =
-      (NotifierJNI*)getNotifierParam((void*)notifierPtr, &status);
-  cleanNotifier((void*)notifierPtr, &status);
+  //NotifierJNI* notify =
+      //(NotifierJNI*)getNotifierParam((void*)notifierPtr, &status);
+  void* d = cleanNotifierThreaded((void*)notifierPtr, &status);
   NOTIFIERJNI_LOG(logDEBUG) << "Status = " << status;
   CheckStatus(env, status);
-  delete notify;
+  if (!d) return;
+  NotifierData* data = (NotifierData*)d;
+  delete data;
 }
 
 /*

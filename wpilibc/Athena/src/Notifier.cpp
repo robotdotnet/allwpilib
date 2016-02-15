@@ -21,7 +21,7 @@ Notifier::Notifier(TimerEventHandler handler) {
     wpi_setWPIErrorWithContext(NullParameter, "handler must not be nullptr");
   m_handler = handler;
   int32_t status = 0;
-  m_notifier = initializeNotifier(&Notifier::Notify, this, &status);
+  m_notifier = initializeNotifierThreaded(nullptr, &Notifier::Notify, nullptr, this, &status);
   wpi_setErrorWithContext(status, getHALErrorMessage(status));
 }
 

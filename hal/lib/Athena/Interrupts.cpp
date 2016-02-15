@@ -6,6 +6,7 @@
 /*----------------------------------------------------------------------------*/
 
 #include "HAL/Interrupts.hpp"
+#include "HAL/CallbackThread.hpp"
 #include "ChipObject.h"
 
 extern void remapDigitalSource(bool analogTrigger, uint32_t &pin, uint8_t &module);
@@ -121,6 +122,22 @@ void attachInterruptHandler(void* interrupt_pointer, InterruptHandlerFunction ha
 {
 	Interrupt* anInterrupt = (Interrupt*)interrupt_pointer;
 	anInterrupt->manager->registerHandler(handler, param, status);
+}
+
+void interruptHandler(uint32_t mask, void* param)
+{
+  callbackHandler(mask, param);
+}
+
+void attachInterruptHandlerThreaded(void* interrupt_pointer, int32_t (*init)(void*),
+                                    void (*process)(uint64_t, void*), void (*end)(void*),
+                                    void* param, int32_t *status)
+{
+  CallbackThread* thr = new CallbackThread;
+  thr->Start();
+  thr->SetFunc(init, process, end, param);
+  
+  attachInterruptHandler(interrupt_pointer, interruptHandler, thr, status);
 }
 
 void setInterruptUpSourceEdge(void* interrupt_pointer, bool risingEdge, bool fallingEdge,

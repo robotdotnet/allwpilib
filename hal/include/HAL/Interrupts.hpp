@@ -21,6 +21,9 @@ extern "C"
 			bool routing_analog_trigger, int32_t *status);
 	void attachInterruptHandler(void* interrupt_pointer, InterruptHandlerFunction handler,
 			void* param, int32_t *status);
+  void attachInterruptHandlerThreaded(void* interrupt_pointer, int32_t (*init)(void*),
+                                      void (*process)(uint64_t, void*), void (*end)(void*),
+                                      void* param, int32_t *status);
 	void setInterruptUpSourceEdge(void* interrupt_pointer, bool risingEdge, bool fallingEdge,
 			int32_t *status);
 }
