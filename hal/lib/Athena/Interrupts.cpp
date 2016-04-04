@@ -130,12 +130,15 @@ void interruptHandler(uint32_t mask, void* param)
 }
 
 void attachInterruptHandlerThreaded(void* interrupt_pointer, int32_t (*init)(void*),
-                                    void (*process)(uint64_t, void*), void (*end)(void*),
+                                    InterruptHandlerFunction handler, void (*end)(void*),
                                     void* param, int32_t *status)
 {
   CallbackThread* thr = new CallbackThread;
   thr->Start();
-  thr->SetFunc(init, process, end, param);
+
+  thr->SetFunc(init, [handler](uint64_t m, void* p) -> void {
+    handler((uint32_t) m, p);
+  }, end, param);
   
   attachInterruptHandler(interrupt_pointer, interruptHandler, thr, status);
 }
